@@ -51,7 +51,7 @@ module Fluent::Plugin
 
       unless message.nil?
 
-        modSecSectionData = message.split(/(-{2,3}[a-zA-Z0-9]{8}-{1,3}[A-Z]--)/)
+        modSecSectionData = message.split(/(-{2,3}[a-zA-Z0-9]{8,16}-{1,3}[A-Z]--)/)
         modSecSectionData.shift
 
         (0..(modSecSectionData.length - 1)).each {|_|
@@ -154,7 +154,9 @@ module Fluent::Plugin
         # split all request headers into a sub-map
         hash['requestHeaders'] = Hash.new
         hash['raw_requestHeaders'].split(/\n/).each do |header|
-          parts = header.split(/:/)
+          next if header.start_with?(':')          # pseudo-headers HTTP/2 (Coraza/Envoy)
+          parts = header.split(/:/, 2)
+          next if parts[1].nil? or parts[0].strip.empty?
           hash['requestHeaders'][parts[0].strip.downcase] = parts[1].strip
         end
 
@@ -179,17 +181,16 @@ module Fluent::Plugin
         matchData = section.match(/(?<serverProtocol>.+?)\s(?<responseStatus>.+)\n?/)
         hash = Hash[matchData.names.zip(matchData.captures)]
 
-        # response headers
-        matchData = section.match(/.+\n(?m)(?<raw_responseHeaders>.+)/)
-        hash = hash.merge(Hash[matchData.names.zip(matchData.captures)])
-
+        # response headers (podem nao existir no Coraza em modo REQUEST_ONLY)
         hash['responseHeaders'] = Hash.new
-        hash['raw_responseHeaders'].split(/\n/).each do |header|
-          parts = header.split(/:/)
-          hash['responseHeaders'][parts[0].strip.downcase] = parts[1].strip
+        matchData = section.match(/.+\n(?m)(?<raw_responseHeaders>.+)/)
+        unless matchData.nil?
+          matchData[:raw_responseHeaders].split(/\n/).each do |header|
+            parts = header.split(/:/, 2)
+            next if parts[1].nil? or parts[0].strip.empty?
+            hash['responseHeaders'][parts[0].strip.downcase] = parts[1].strip
+          end
         end
-
-        hash.delete('raw_responseHeaders')
       else
         hash = Hash.new
       end
@@ -223,9 +224,9 @@ module Fluent::Plugin
         trailer_array = section.split(/\n/)
 
         trailer_array.each do |entry|
-          if entry.match(/^Message|ModSecurity: /)
+          if entry.match(/^Message|ModSecurity: |Coraza: /)
             msg = Hash.new
-            extractVal(/(?:Message|ModSecurity): (.+)\s\[file/, entry, msg, 'info')
+            extractVal(/(?:Message|ModSecurity|Coraza): (.+?)\s\[file/, entry, msg, 'info')
             extractVal(/\[file "(.*?)"\]/, entry, msg, 'file')
             extractVal(/\[line "(.*?)"\]/, entry, msg, 'line')
             extractVal(/\[id "(.*?)"\]/, entry, msg, 'id')
@@ -248,7 +249,8 @@ module Fluent::Plugin
 
         # ModSecurity v3 does not log Message information
         section.split(/\n/).each do |line|
-          parts = line.split(/:\s/)
+          parts = line.split(/:\s/, 2)
+          next if parts[1].nil?
           hash['auditLogTrailer'][parts[0].strip] = parts[1].strip
         end
 
@@ -281,8 +283,8 @@ module Fluent::Plugin
         secRuleIds = Array.new
 
         matchedRules_array.each do |entry|
-          if entry.match(/^SecRule /) and entry.match(/,id:/)
-            secRuleIds.push(/,id:(?<ruleId>\d+)/.match(entry)[:ruleId])
+          if entry.match(/^SecRule /) and entry.match(/[",]id:/)
+            secRuleIds.push(/[",]id:(?<ruleId>\d+)/.match(entry)[:ruleId])
           end
         end
 

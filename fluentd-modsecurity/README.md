@@ -1,61 +1,128 @@
-# fluentd-modsecurity
+# fluentd-modsecurity (Envoy + Coraza)
 
-[Fluentd](http://fluentd.org/) output (filter) plugin for parsing a [ModSecurity](https://www.modsecurity.org/) audit log
+Plugin de output (filtro) do [Fluentd](https://www.fluentd.org/) para ler o **audit log do [OWASP Coraza](https://coraza.io/)** rodando no **[Envoy Gateway](https://gateway.envoyproxy.io/)** (módulo dinâmico `coraza-waf` do [Built On Envoy](https://builtonenvoy.io/extensions/coraza-waf/)).
 
-This is intended to serve as an example starting point for how to ingest
-parse entries from a ModSecurity audit log file using fluentd into a more first-class
-structured object that can then be forwarded on to another output.
+O plugin transforma cada evento do audit log (formato `Native`) em um registro estruturado, um registro por regra disparada, pronto para enviar ao Elasticsearch.
 
-## Getting Started
+> Fork do plugin usado com o ModSecurity no ingress-nginx. Também continua lendo o formato do libmodsecurity3 (nginx).
 
-More info and example output:
-* http://bitsofinfo.wordpress.com/2013/11/11/modsecurity-audit-logs-fluentd/
+## Fluxo
 
-ModSecurity Audit Log format:
-* https://github.com/SpiderLabs/ModSecurity/wiki/ModSecurity-2-Data-Formats
-* https://www.nginx.com/blog/modsecurity-logging-and-debugging/
+```
+Envoy (Coraza) ──► /var/log/coraza/audit.log  (SecAuditLogFormat Native)
+                       │  emptyDir compartilhado no pod Envoy
+                       └─► sidecar fluentd ─► modsecurity-audit-format ─► geoip ─► Elasticsearch
+```
 
-### Prerequisites
+## Diferenças em relação ao ModSecurity (nginx)
 
-Build the gem
+| Item | ModSecurity (libmodsecurity3) | Coraza | Tratamento no plugin |
+|---|---|---|---|
+| Separador do evento | `---a1b2c3d4---A--` (ID de 8) | `--ZXcsyrDxmwXuIxGl-A--` (ID de 16) | Aceita ID de 8 a 16 caracteres |
+| Seção B (headers) | Headers normais | Inclui pseudo-headers HTTP/2 (`:path`, `:authority`) | Ignora linhas que começam com `:` |
+| Seção F (resposta) | Status + headers | `HTTP/1.1 0`, sem headers (modo `REQUEST_ONLY`) | Aceita seção sem headers |
+| Seção H (regras) | Linhas com `ModSecurity:` | Linhas com `Coraza:` | Aceita os dois |
+| Seção K (regras) | `,id:942100` | `"id:942100` | Aceita os dois |
+
+### Diferenças que permanecem nos dados
+
+| Campo | ModSecurity | Coraza |
+|---|---|---|
+| `responseStatus` | `403`, `200`... | `0` (o módulo não processa a resposta no modo `REQUEST_ONLY`) |
+| `modsec_timestamp` | `06/Nov/2026:19:12:58 +0000` | `2026/11/06 19:12:58` |
+| `destIp` / `destPort` | IP do pod | `127.0.0.1` / `80` |
+| `violation.severity` | número (`2`) | texto (`critical`) |
+
+## Pré-requisitos
+
+### Diretivas do Coraza (EnvoyExtensionPolicy)
+
+```yaml
+directives:
+  - Include @coraza.conf
+  - SecRuleEngine DetectionOnly
+  - SecAuditEngine RelevantOnly
+  - SecAuditLogParts ABDEFHIJKZ
+  - SecAuditLogFormat Native
+  - SecAuditLog /var/log/coraza/audit.log
+  - Include @crs-setup.conf
+  - Include @owasp_crs/*.conf
+```
+
+O caminho `/var/log/coraza` precisa ser um volume (`emptyDir`) montado no container `envoy` e no sidecar `fluentd`.
+
+## Build
+
+Gerar a gem:
 ```
 gem build fluent-plugin-modsecurity.gemspec
-``` 
-
-Install the gem to fluentd
 ```
-fluent-gem install ./fluent-plugin-modsecurity-0.2.gem
-``` 
 
-## Deployment
+Instalar no fluentd:
+```
+fluent-gem install ./fluent-plugin-modsecurity-*.gem
+```
 
-Example fluent.conf setup.
+Imagem Docker (inclui `fluent-plugin-elasticsearch` e `fluent-plugin-geoip`):
+```
+docker build -t pedrobernardes/fluentd-modsecurity:<tag> .
+```
+
+## Exemplo de fluent.conf
 
 ```
-# (1) Consume the input
+# (1) Leitura do audit log do Coraza
 <source>
   @type tail
   tag raw-modsec
-  path /path/to/modsec_audit.log
+  path /var/log/coraza/audit.log
   <parse>
     @type multiline
-    format_firstline /^-{2,3}][a-zA-Z0-9]{8}-{2,3}A--$/
+    format_firstline /^-{2,3}[a-zA-Z0-9]{8,16}-{1,3}A--$/
     format1 /(?<message>.*)/
   </parse>
 </source>
 
-# (2) Massage it via this plugin to a more structured object
+# (2) Estrutura o evento (1 registro por regra disparada)
 <match raw-modsec>
   @type modsecurity-audit-format
   tag modsec-formatted
 </match>
 
-# (3) Output to stdout
+# (3) Saída
 <match modsec-formatted>
   @type stdout
 </match>
 ```
 
-## License
+## Exemplo de registro gerado
 
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
+```json
+{
+  "sourceIp": "181.233.129.27",
+  "httpMethod": "GET",
+  "requestedUrl": "/?id=1'+OR+'1'%3D'1",
+  "requestHeaders": { "host": "app.exemplo.com.br", "user-agent": "curl/8.10.1" },
+  "responseStatus": "0",
+  "secRuleIds": ["942100", "949110"],
+  "violation": {
+    "id": "942100",
+    "msg": "SQL Injection Attack Detected via libinjection",
+    "severity": "critical",
+    "ver": "OWASP_CRS/4.25.0",
+    "file": "@owasp_crs/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+  },
+  "tags": ["attack-sqli", "paranoia-level/1", "OWASP_CRS"]
+}
+```
+
+## Referências
+
+* Plugin original: https://github.com/bitsofinfo/fluentd-modsecurity
+* Formato de audit log do ModSecurity: https://github.com/SpiderLabs/ModSecurity/wiki/ModSecurity-2-Data-Formats
+* Coraza WAF (Built On Envoy): https://builtonenvoy.io/extensions/coraza-waf/
+* Envoy Gateway - Dynamic Modules: https://gateway.envoyproxy.io/latest/tasks/extensibility/dynamic-modules/
+
+## Licença
+
+Apache 2.0 - veja o arquivo [LICENSE](LICENSE).
